@@ -1,0 +1,186 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Sat, 6 Jun 2026 00:00:00 +0900
+Subject: [PATCH] Profile Milvus expression result cache
+
+This scaffold targets the expression/filter cache path found in Milvus master:
+
+  internal/core/src/exec/expression/ExprCache.h
+  internal/core/src/exec/expression/ExprCache.cpp
+
+The public source search did not find ExprCacheManager by that exact name, but
+it did find ExprResCacheManager, which is used by FilterBitsNode for expression
+result bitset reuse. This patch instruments that equivalent path.
+
+The profile is guarded by MILVUS_FILTER_PROFILE=1 and appends CSV rows to:
+
+  /tmp/milvus_expr_cache_profile.csv
+
+TODO:
+- ExprResCacheManager::Put() does not receive the filter build duration. This
+  scaffold records filter_build_us=0 at insert time and documents the field.
+  For exact cache-miss build timing, extend Value or add a FilterBitsNode-side
+  miss/build hook in the final server checkout.
+- Verify TargetBitmap::count() availability on the exact checkout.
+
+diff --git a/internal/core/src/exec/expression/ExprCache.cpp b/internal/core/src/exec/expression/ExprCache.cpp
+index 503e0951bb..0000000000 100644
+--- a/internal/core/src/exec/expression/ExprCache.cpp
++++ b/internal/core/src/exec/expression/ExprCache.cpp
+@@ -16,10 +16,102 @@
+ #include "exec/expression/ExprCache.h"
+ 
++#include <chrono>
++#include <cstdlib>
++#include <fstream>
++#include <mutex>
++#include <sstream>
++
+ namespace milvus {
+ namespace exec {
+ 
+ std::atomic<bool> ExprResCacheManager::enabled_{false};
+ 
++namespace {
++
++std::mutex g_expr_cache_profile_mu;
++
++bool
++ExprCacheProfileEnabled() {
++    const char* value = std::getenv("MILVUS_FILTER_PROFILE");
++    return value != nullptr && std::string(value) == "1";
++}
++
++int64_t
++ExprCacheUnixMicros() {
++    return std::chrono::duration_cast<std::chrono::microseconds>(
++               std::chrono::system_clock::now().time_since_epoch())
++        .count();
++}
++
++std::string
++ExprCacheCsvEscape(const std::string& input) {
++    std::string out;
++    out.reserve(input.size() + 2);
++    out.push_back('"');
++    for (char c : input) {
++        if (c == '"') {
++            out.push_back('"');
++        }
++        out.push_back(c);
++    }
++    out.push_back('"');
++    return out;
++}
++
++size_t
++ExprCacheBitsetBytes(const ExprResCacheManager::Value& value) {
++    size_t bytes = 0;
++    if (value.result) {
++        bytes += (value.result->size() + 7) / 8;
++    }
++    if (value.valid_result) {
++        bytes += (value.valid_result->size() + 7) / 8;
++    }
++    return bytes;
++}
++
++int64_t
++ExprCacheMatchedCount(const ExprResCacheManager::Value& value) {
++    if (!value.result) {
++        return 0;
++    }
++    // Cached FilterBitsNode result uses set bits as filtered-out rows.
++    // TODO: adjust if the target checkout stores cached predicate matches
++    // rather than exclusion bitsets.
++    return value.active_count -
++           static_cast<int64_t>(value.result->count());
++}
++
++void
++AppendExprCacheProfileRow(const ExprResCacheManager::Key& key,
++                          const std::string& event_type,
++                          double cache_lookup_us,
++                          double filter_build_us,
++                          const ExprResCacheManager::Value* value) {
++    if (!ExprCacheProfileEnabled()) {
++        return;
++    }
++    const int64_t rows = value != nullptr ? value->active_count : 0;
++    const size_t bitset_bytes = value != nullptr ? ExprCacheBitsetBytes(*value) : 0;
++    const int64_t matched = value != nullptr ? ExprCacheMatchedCount(*value) : 0;
++
++    std::lock_guard<std::mutex> lock(g_expr_cache_profile_mu);
++    std::ofstream out("/tmp/milvus_expr_cache_profile.csv", std::ios::app);
++    out << ExprCacheUnixMicros() << ','
++        << ExprCacheCsvEscape("") << ','
++        << key.segment_id << ','
++        << ExprCacheCsvEscape(key.signature) << ','
++        << ExprCacheCsvEscape(key.signature) << ','
++        << event_type << ','
++        << static_cast<int64_t>(cache_lookup_us) << ','
++        << static_cast<int64_t>(filter_build_us) << ','
++        << bitset_bytes << ','
++        << matched << ','
++        << rows << '\n';
++}
++
++}  // namespace
++
+ ExprResCacheManager&
+ ExprResCacheManager::Instance() {
+     static ExprResCacheManager instance;
+@@ -57,13 +142,20 @@ ExprResCacheManager::GetEntryCount() const {
+ bool
+ ExprResCacheManager::Get(const Key& key, Value& out_value) {
+     if (!IsEnabled()) {
+         return false;
+     }
+ 
++    auto lookup_start = std::chrono::high_resolution_clock::now();
+     auto it = concurrent_map_.find(key);
+     if (it == concurrent_map_.end()) {
++        auto lookup_end = std::chrono::high_resolution_clock::now();
++        auto lookup_us =
++            std::chrono::duration<double, std::micro>(lookup_end - lookup_start)
++                .count();
++        AppendExprCacheProfileRow(key, "lookup", lookup_us, 0, nullptr);
++        AppendExprCacheProfileRow(key, "miss", lookup_us, 0, nullptr);
+         return false;
+     }
+ 
+     out_value = it->second.value;
+     {
+@@ -70,6 +163,13 @@ ExprResCacheManager::Get(const Key& key, Value& out_value) {
+         lru_list_.splice(lru_list_.begin(), lru_list_, it->second.lru_it);
+     }
+ 
++    auto lookup_end = std::chrono::high_resolution_clock::now();
++    auto lookup_us =
++        std::chrono::duration<double, std::micro>(lookup_end - lookup_start)
++            .count();
++    AppendExprCacheProfileRow(key, "lookup", lookup_us, 0, &out_value);
++    AppendExprCacheProfileRow(key, "hit", lookup_us, 0, &out_value);
++
+     LOG_DEBUG("get expr res cache, segment_id: {}, key: {}",
+               key.segment_id,
+               key.signature);
+@@ -107,6 +207,10 @@ ExprResCacheManager::Put(const Key& key, const Value& value) {
+         concurrent_map_.emplace(key, std::move(entry));
+     }
+ 
++    // TODO: filter_build_us is not available at this layer. Record 0 here and
++    // populate it from FilterBitsNode if exact cache-miss build timing is needed.
++    AppendExprCacheProfileRow(key, "insert", 0, 0, &stored_value);
++
+     if (current_bytes_.load() > capacity_bytes_.load()) {
+         EnsureCapacity();
+     }
+@@ -140,6 +244,7 @@ ExprResCacheManager::EnsureCapacity() {
+         auto it = concurrent_map_.find(back_key);
+         if (it != concurrent_map_.end()) {
+             current_bytes_.fetch_sub(it->second.value.bytes);
++            AppendExprCacheProfileRow(back_key, "evict", 0, 0, &it->second.value);
+             concurrent_map_.unsafe_erase(it);
+         }
+         lru_list_.pop_back();

@@ -1,0 +1,424 @@
+diff --git a/internal/core/src/exec/expression/ExprCache.cpp b/internal/core/src/exec/expression/ExprCache.cpp
+index 503e0951bb..fa8035775f 100644
+--- a/internal/core/src/exec/expression/ExprCache.cpp
++++ b/internal/core/src/exec/expression/ExprCache.cpp
+@@ -13,6 +13,11 @@
+ // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
++#include <chrono>
++#include <cstdlib>
++#include <fstream>
++#include <mutex>
++#include <sstream>
+ 
+ #include "exec/expression/ExprCache.h"
+ 
+@@ -21,6 +26,91 @@ namespace exec {
+ 
+ std::atomic<bool> ExprResCacheManager::enabled_{false};
+ 
++namespace {
++
++std::mutex g_expr_cache_profile_mu;
++
++bool
++ExprCacheProfileEnabled() {
++    const char* value = std::getenv("MILVUS_FILTER_PROFILE");
++    return value != nullptr && std::string(value) == "1";
++}
++
++int64_t
++ExprCacheUnixMicros() {
++    return std::chrono::duration_cast<std::chrono::microseconds>(
++               std::chrono::system_clock::now().time_since_epoch())
++        .count();
++}
++
++std::string
++ExprCacheCsvEscape(const std::string& input) {
++    std::string out;
++    out.reserve(input.size() + 2);
++    out.push_back('"');
++    for (char c : input) {
++        if (c == '"') {
++            out.push_back('"');
++        }
++        out.push_back(c);
++    }
++    out.push_back('"');
++    return out;
++}
++
++size_t
++ExprCacheBitsetBytes(const ExprResCacheManager::Value& value) {
++    size_t bytes = 0;
++    if (value.result) {
++        bytes += (value.result->size() + 7) / 8;
++    }
++    if (value.valid_result) {
++        bytes += (value.valid_result->size() + 7) / 8;
++    }
++    return bytes;
++}
++
++int64_t
++ExprCacheMatchedCount(const ExprResCacheManager::Value& value) {
++    if (!value.result) {
++        return 0;
++    }
++    return value.active_count -
++           static_cast<int64_t>(value.result->count());
++}
++
++void
++AppendExprCacheProfileRow(const ExprResCacheManager::Key& key,
++                          const std::string& event_type,
++                          double cache_lookup_us,
++                          double filter_build_us,
++                          const ExprResCacheManager::Value* value) {
++    if (!ExprCacheProfileEnabled()) {
++        return;
++    }
++    const int64_t rows = value != nullptr ? value->active_count : 0;
++    const size_t bitset_bytes =
++        value != nullptr ? ExprCacheBitsetBytes(*value) : 0;
++    const int64_t matched =
++        value != nullptr ? ExprCacheMatchedCount(*value) : 0;
++
++    std::lock_guard<std::mutex> lock(g_expr_cache_profile_mu);
++    std::ofstream out("/tmp/milvus_expr_cache_profile.csv", std::ios::app);
++    out << ExprCacheUnixMicros() << ','
++        << ExprCacheCsvEscape("") << ','
++        << key.segment_id << ','
++        << ExprCacheCsvEscape(key.signature) << ','
++        << ExprCacheCsvEscape(key.signature) << ','
++        << event_type << ','
++        << static_cast<int64_t>(cache_lookup_us) << ','
++        << static_cast<int64_t>(filter_build_us) << ','
++        << bitset_bytes << ','
++        << matched << ','
++        << rows << '\n';
++}
++
++}  // namespace
++
+ ExprResCacheManager&
+ ExprResCacheManager::Instance() {
+     static ExprResCacheManager instance;
+@@ -64,8 +154,15 @@ ExprResCacheManager::Get(const Key& key, Value& out_value) {
+         return false;
+     }
+ 
++    auto lookup_start = std::chrono::high_resolution_clock::now();
+     auto it = concurrent_map_.find(key);
+     if (it == concurrent_map_.end()) {
++        auto lookup_end = std::chrono::high_resolution_clock::now();
++        auto lookup_us =
++            std::chrono::duration<double, std::micro>(lookup_end - lookup_start)
++                .count();
++        AppendExprCacheProfileRow(key, "lookup", lookup_us, 0, nullptr);
++        AppendExprCacheProfileRow(key, "miss", lookup_us, 0, nullptr);
+         return false;
+     }
+ 
+@@ -75,6 +172,13 @@ ExprResCacheManager::Get(const Key& key, Value& out_value) {
+         lru_list_.splice(lru_list_.begin(), lru_list_, it->second.lru_it);
+     }
+ 
++    auto lookup_end = std::chrono::high_resolution_clock::now();
++    auto lookup_us =
++        std::chrono::duration<double, std::micro>(lookup_end - lookup_start)
++            .count();
++    AppendExprCacheProfileRow(key, "lookup", lookup_us, 0, &out_value);
++    AppendExprCacheProfileRow(key, "hit", lookup_us, 0, &out_value);
++
+     LOG_DEBUG("get expr res cache, segment_id: {}, key: {}",
+               key.segment_id,
+               key.signature);
+@@ -114,6 +218,8 @@ ExprResCacheManager::Put(const Key& key, const Value& value) {
+         concurrent_map_.emplace(key, std::move(entry));
+     }
+ 
++    AppendExprCacheProfileRow(key, "insert", 0, 0, &stored_value);
++
+     if (current_bytes_.load() > capacity_bytes_.load()) {
+         EnsureCapacity();
+     }
+@@ -153,6 +259,7 @@ ExprResCacheManager::EnsureCapacity() {
+         auto it = concurrent_map_.find(back_key);
+         if (it != concurrent_map_.end()) {
+             current_bytes_.fetch_sub(it->second.value.bytes);
++            AppendExprCacheProfileRow(back_key, "evict", 0, 0, &it->second.value);
+             concurrent_map_.unsafe_erase(it);
+         }
+         lru_list_.pop_back();
+diff --git a/internal/core/src/exec/operator/FilterBitsNode.cpp b/internal/core/src/exec/operator/FilterBitsNode.cpp
+index 0090d93cdd..ba94d96f06 100644
+--- a/internal/core/src/exec/operator/FilterBitsNode.cpp
++++ b/internal/core/src/exec/operator/FilterBitsNode.cpp
+@@ -17,6 +17,11 @@
+ #include "FilterBitsNode.h"
+ 
+ #include <algorithm>
++#include <sstream>
++#include <mutex>
++#include <fstream>
++#include <cstdlib>
++#include <atomic>
+ #include <chrono>
+ #include <ratio>
+ #include <utility>
+@@ -39,6 +44,89 @@ namespace exec {
+ 
+ namespace {
+ 
++std::atomic<uint64_t> g_filter_profile_id{0};
++std::mutex g_filter_profile_mu;
++
++bool
++FilterProfileEnabled() {
++    const char* value = std::getenv("MILVUS_FILTER_PROFILE");
++    return value != nullptr && std::string(value) == "1";
++}
++
++int64_t
++UnixMicros() {
++    return std::chrono::duration_cast<std::chrono::microseconds>(
++               std::chrono::system_clock::now().time_since_epoch())
++        .count();
++}
++
++std::string
++CsvEscape(const std::string& input) {
++    std::string out;
++    out.reserve(input.size() + 2);
++    out.push_back('"');
++    for (char c : input) {
++        if (c == '"') {
++            out.push_back('"');
++        }
++        out.push_back(c);
++    }
++    out.push_back('"');
++    return out;
++}
++
++std::string
++BuildProfileId(QueryContext* query_context) {
++    if (query_context != nullptr) {
++        auto query_id = query_context->query_id();
++        if (!query_id.empty()) {
++            return query_id;
++        }
++    }
++    return std::to_string(g_filter_profile_id.fetch_add(1));
++}
++
++int64_t
++SegmentId(QueryContext* query_context) {
++    auto* segment = query_context != nullptr ? query_context->get_segment()
++                                             : nullptr;
++    return segment != nullptr ? segment->get_segment_id() : -1;
++}
++
++int64_t
++MatchedCountFromExclusionBitmap(const TargetBitmap& bitset,
++                                int64_t segment_rows) {
++    return segment_rows - static_cast<int64_t>(bitset.count());
++}
++
++int64_t
++MatchedCountFromExclusionView(const TargetBitmapView& view,
++                              int64_t segment_rows) {
++    return segment_rows - static_cast<int64_t>(view.count());
++}
++
++void
++AppendFilterProfileRow(QueryContext* query_context,
++                       const std::string& predicate_string,
++                       int64_t segment_rows,
++                       double filter_gen_us,
++                       size_t bitset_bytes,
++                       int64_t matched_count) {
++    if (!FilterProfileEnabled()) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(g_filter_profile_mu);
++    std::ofstream out("/tmp/milvus_filter_profile.csv", std::ios::app);
++    out << UnixMicros() << ','
++        << CsvEscape(BuildProfileId(query_context)) << ','
++        << SegmentId(query_context) << ','
++        << CsvEscape(predicate_string) << ','
++        << segment_rows << ','
++        << static_cast<int64_t>(filter_gen_us) << ','
++        << bitset_bytes << ','
++        << matched_count << '\n';
++}
++
+ std::string
+ BuildExprCacheKey(const plan::FilterBitsNode& filter,
+                   QueryContext* query_context) {
+@@ -76,6 +164,7 @@ PhyFilterBitsNode::PhyFilterBitsNode(
+     if (enable_expr_cache_) {
+         expr_cache_key_ = BuildExprCacheKey(*filter, query_context_);
+     }
++    filter_profile_predicate_ = filter->ToString();
+ }
+ 
+ void
+@@ -191,6 +280,13 @@ PhyFilterBitsNode::GetOutput() {
+         milvus::monitor::internal_core_search_latency_scalar.Observe(
+             scalar_cost / 1000);
+ 
++        AppendFilterProfileRow(
++            query_context_,
++            filter_profile_predicate_,
++            need_process_rows_,
++            scalar_cost,
++            (col_vec_size + 7) / 8,
++            MatchedCountFromExclusionView(view, need_process_rows_));
+         return std::make_shared<RowVector>(col_res);
+     }
+ 
+@@ -241,6 +337,10 @@ PhyFilterBitsNode::GetOutput() {
+         ExprResCacheManager::Instance().Put(key, v);
+     }
+ 
++    const size_t profile_bitset_bytes = (bitset.size() + 7) / 8;
++    const int64_t profile_matched_count =
++        MatchedCountFromExclusionBitmap(bitset, need_process_rows_);
++
+     // num_processed_rows_ = need_process_rows_;
+     std::vector<VectorPtr> col_res;
+     col_res.push_back(std::make_shared<ColumnVector>(std::move(bitset),
+@@ -253,6 +353,13 @@ PhyFilterBitsNode::GetOutput() {
+     milvus::monitor::internal_core_search_latency_scalar.Observe(scalar_cost /
+                                                                  1000);
+ 
++    AppendFilterProfileRow(
++        query_context_,
++        filter_profile_predicate_,
++        need_process_rows_,
++        scalar_cost,
++        profile_bitset_bytes,
++        profile_matched_count);
+     return std::make_shared<RowVector>(col_res);
+ }
+ 
+diff --git a/internal/core/src/exec/operator/FilterBitsNode.h b/internal/core/src/exec/operator/FilterBitsNode.h
+index 8c8fdbb464..fafd90f76e 100644
+--- a/internal/core/src/exec/operator/FilterBitsNode.h
++++ b/internal/core/src/exec/operator/FilterBitsNode.h
+@@ -80,6 +80,8 @@ class PhyFilterBitsNode : public Operator {
+     // Cache backend is the process-level ExprResCacheManager.
+     bool enable_expr_cache_ = false;
+     std::string expr_cache_key_;
++    // Human-readable predicate string for optional profiling logs.
++    std::string filter_profile_predicate_;
+ };
+ }  // namespace exec
+ }  // namespace milvus
+diff --git a/internal/core/src/exec/operator/VectorSearchNode.cpp b/internal/core/src/exec/operator/VectorSearchNode.cpp
+index 4c3a965746..168fc7c0e2 100644
+--- a/internal/core/src/exec/operator/VectorSearchNode.cpp
++++ b/internal/core/src/exec/operator/VectorSearchNode.cpp
+@@ -17,6 +17,11 @@
+ #include "VectorSearchNode.h"
+ 
+ #include <algorithm>
++#include <sstream>
++#include <mutex>
++#include <fstream>
++#include <cstdlib>
++#include <atomic>
+ #include <chrono>
+ #include <functional>
+ #include <ratio>
+@@ -43,6 +48,73 @@
+ namespace milvus {
+ namespace exec {
+ 
++namespace {
++
++std::atomic<uint64_t> g_search_profile_id{0};
++std::mutex g_search_profile_mu;
++
++bool
++SearchProfileEnabled() {
++    const char* value = std::getenv("MILVUS_FILTER_PROFILE");
++    return value != nullptr && std::string(value) == "1";
++}
++
++int64_t
++SearchUnixMicros() {
++    return std::chrono::duration_cast<std::chrono::microseconds>(
++               std::chrono::system_clock::now().time_since_epoch())
++        .count();
++}
++
++std::string
++SearchCsvEscape(const std::string& input) {
++    std::string out;
++    out.reserve(input.size() + 2);
++    out.push_back('"');
++    for (char c : input) {
++        if (c == '"') {
++            out.push_back('"');
++        }
++        out.push_back(c);
++    }
++    out.push_back('"');
++    return out;
++}
++
++std::string
++SearchProfileId(QueryContext* query_context) {
++    if (query_context != nullptr) {
++        auto query_id = query_context->query_id();
++        if (!query_id.empty()) {
++            return query_id;
++        }
++    }
++    return std::to_string(g_search_profile_id.fetch_add(1));
++}
++
++void
++AppendSearchProfileRow(QueryContext* query_context,
++                       double total_search_us,
++                       int64_t nq,
++                       int64_t topk,
++                       const std::string& index_type,
++                       const std::string& predicate_string) {
++    if (!SearchProfileEnabled()) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(g_search_profile_mu);
++    std::ofstream out("/tmp/milvus_search_profile.csv", std::ios::app);
++    out << SearchUnixMicros() << ','
++        << SearchCsvEscape(SearchProfileId(query_context)) << ','
++        << static_cast<int64_t>(total_search_us) << ','
++        << nq << ','
++        << topk << ','
++        << SearchCsvEscape(index_type) << ','
++        << SearchCsvEscape(predicate_string) << '\n';
++}
++
++}  // namespace
++
+ static milvus::SearchResult
+ empty_search_result(int64_t num_queries) {
+     milvus::SearchResult final_result;
+@@ -192,6 +264,12 @@ PhyVectorSearchNode::GetOutput() {
+             .count();
+     milvus::monitor::internal_core_search_latency_vector.Observe(vector_cost /
+                                                                  1000);
++    AppendSearchProfileRow(query_context_,
++                           vector_cost,
++                           num_queries,
++                           search_info_.topk_,
++                           search_info_.search_params_.dump(),
++                           "");
+     // vector search stores result in query_context;
+     // this node returns the bitset for downstream operators
+     return input_;

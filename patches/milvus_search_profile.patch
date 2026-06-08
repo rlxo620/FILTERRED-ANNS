@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Sat, 6 Jun 2026 00:00:00 +0900
+Subject: [PATCH] Profile Milvus vector search timing with filter bitset
+
+This scaffold targets the path where FilterBitsNode output becomes a
+BitsetView passed to vector search:
+
+  internal/core/src/exec/operator/VectorSearchNode.cpp
+
+The profile is guarded by MILVUS_FILTER_PROFILE=1 and appends CSV rows to:
+
+  /tmp/milvus_search_profile.csv
+
+TODO:
+- PhyVectorSearchNode does not directly own the scalar predicate string. This
+  scaffold records an empty predicate_string and expects analysis to join search
+  rows with filter rows by profile_id when QueryContext::query_id() is present.
+  If predicate_string is mandatory in search rows, add a QueryContext field set
+  by FilterBitsNode and read it here.
+- SearchInfo does not expose index_type directly in the inspected header. This
+  scaffold records search_params_.dump() as the best static proxy. Replace with
+  the exact index metadata accessor in the final checkout if needed.
+- The timer starts inside PhyVectorSearchNode after upstream filter generation.
+  If strict end-to-end search time is required, add a Driver/segment-level timer.
+
+diff --git a/internal/core/src/exec/operator/VectorSearchNode.cpp b/internal/core/src/exec/operator/VectorSearchNode.cpp
+index 4558cb3554..0000000000 100644
+--- a/internal/core/src/exec/operator/VectorSearchNode.cpp
++++ b/internal/core/src/exec/operator/VectorSearchNode.cpp
+@@ -16,9 +16,14 @@
+ #include "VectorSearchNode.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <chrono>
++#include <cstdlib>
++#include <fstream>
+ #include <functional>
++#include <mutex>
+ #include <ratio>
++#include <sstream>
+ #include <utility>
+ #include <vector>
+ 
+@@ -43,6 +49,73 @@
+ namespace milvus {
+ namespace exec {
+ 
++namespace {
++
++std::atomic<uint64_t> g_search_profile_id{0};
++std::mutex g_search_profile_mu;
++
++bool
++SearchProfileEnabled() {
++    const char* value = std::getenv("MILVUS_FILTER_PROFILE");
++    return value != nullptr && std::string(value) == "1";
++}
++
++int64_t
++SearchUnixMicros() {
++    return std::chrono::duration_cast<std::chrono::microseconds>(
++               std::chrono::system_clock::now().time_since_epoch())
++        .count();
++}
++
++std::string
++SearchCsvEscape(const std::string& input) {
++    std::string out;
++    out.reserve(input.size() + 2);
++    out.push_back('"');
++    for (char c : input) {
++        if (c == '"') {
++            out.push_back('"');
++        }
++        out.push_back(c);
++    }
++    out.push_back('"');
++    return out;
++}
++
++std::string
++SearchProfileId(QueryContext* query_context) {
++    if (query_context != nullptr) {
++        auto query_id = query_context->query_id();
++        if (!query_id.empty()) {
++            return query_id;
++        }
++    }
++    return std::to_string(g_search_profile_id.fetch_add(1));
++}
++
++void
++AppendSearchProfileRow(QueryContext* query_context,
++                       double total_search_us,
++                       int64_t nq,
++                       int64_t topk,
++                       const std::string& index_type,
++                       const std::string& predicate_string) {
++    if (!SearchProfileEnabled()) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(g_search_profile_mu);
++    std::ofstream out("/tmp/milvus_search_profile.csv", std::ios::app);
++    out << SearchUnixMicros() << ','
++        << SearchCsvEscape(SearchProfileId(query_context)) << ','
++        << static_cast<int64_t>(total_search_us) << ','
++        << nq << ','
++        << topk << ','
++        << SearchCsvEscape(index_type) << ','
++        << SearchCsvEscape(predicate_string) << '\n';
++}
++
++}  // namespace
++
+ static milvus::SearchResult
+ empty_search_result(int64_t num_queries) {
+     milvus::SearchResult final_result;
+@@ -202,5 +275,15 @@ PhyVectorSearchNode::GetOutput() {
+     milvus::monitor::internal_core_search_latency_vector.Observe(vector_cost /
+                                                                  1000);
++    // TODO: SearchInfo has no direct index_type field in the inspected
++    // common/QueryInfo.h. search_params_ is recorded as a proxy until the
++    // exact index metadata accessor is selected in the final server checkout.
++    AppendSearchProfileRow(query_context_,
++                           vector_cost,
++                           num_queries,
++                           search_info_.topk_,
++                           search_info_.search_params_.dump(),
++                           "");
++
+     // vector search stores result in query_context;
+     // this node returns the bitset for downstream operators
+     return input_;
