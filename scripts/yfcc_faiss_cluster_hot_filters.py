@@ -15,6 +15,7 @@ Typical output:
   * query_probed_clusters.csv
   * global_query_filter_hotness.csv
   * cluster_query_filter_hotness.csv
+  * cluster_base_counts.csv, with --assign-base-clusters
   * cluster_hot_filter_summary.csv
 
 Supported vector formats:
@@ -398,6 +399,16 @@ def update_hotness(
     return global_counts, per_cluster, trace_rows
 
 
+def assign_base_cluster_counts(quantizer, base: MatrixSource, chunk_rows: int) -> Counter[int]:
+    counts: Counter[int] = Counter()
+    for _start, chunk in base.iter_chunks(chunk_rows):
+        _distances, cluster_ids = quantizer.search(chunk, 1)
+        for cluster_id in cluster_ids[:, 0]:
+            if int(cluster_id) >= 0:
+                counts[int(cluster_id)] += 1
+    return counts
+
+
 def top_keys(counter: Counter[str], top_k: int) -> List[str]:
     return [key for key, _count in counter.most_common(top_k)]
 
@@ -414,6 +425,7 @@ def build_rows(
     global_counts: Counter[str],
     per_cluster: Dict[int, Counter[str]],
     top_k: int,
+    base_cluster_counts: Optional[Counter[int]] = None,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]], Dict[str, object]]:
     total_queries = sum(global_counts.values())
     global_top = top_keys(global_counts, top_k)
@@ -459,6 +471,9 @@ def build_rows(
                     "cluster_id": cluster_id,
                     "rank": rank,
                     "predicate": pred,
+                    "base_vectors_in_cluster": base_cluster_counts.get(cluster_id, 0)
+                    if base_cluster_counts
+                    else "",
                     "cluster_query_hits": counter[pred],
                     "cluster_total_hits": cluster_total,
                     "cluster_hit_fraction": counter[pred] / cluster_total,
@@ -494,6 +509,19 @@ def build_rows(
         if entropy_values
         else 0.0,
     }
+    if base_cluster_counts:
+        populated = [count for count in base_cluster_counts.values() if count > 0]
+        summary.update(
+            {
+                "base_vectors_assigned": sum(base_cluster_counts.values()),
+                "base_populated_clusters": len(populated),
+                "base_cluster_min_size": min(populated) if populated else 0,
+                "base_cluster_max_size": max(populated) if populated else 0,
+                "base_cluster_avg_size": sum(populated) / len(populated)
+                if populated
+                else 0.0,
+            }
+        )
     return global_rows, local_rows, summary
 
 
@@ -522,6 +550,11 @@ def main() -> None:
     parser.add_argument("--chunk-rows", type=int, default=8192)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument(
+        "--assign-base-clusters",
+        action="store_true",
+        help="Assign every base vector to its nearest IVF centroid and write cluster_base_counts.csv",
+    )
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args()
 
@@ -539,10 +572,16 @@ def main() -> None:
     )
 
     quantizer, nlist = train_or_load_quantizer(args, base)
+    base_cluster_counts: Optional[Counter[int]] = None
+    if args.assign_base_clusters:
+        base_cluster_counts = assign_base_cluster_counts(quantizer, base, args.chunk_rows)
+
     global_counts, per_cluster, trace_rows = update_hotness(
         quantizer, queries, predicates, args.nprobe, args.chunk_rows
     )
-    global_rows, local_rows, summary = build_rows(global_counts, per_cluster, args.top_k)
+    global_rows, local_rows, summary = build_rows(
+        global_counts, per_cluster, args.top_k, base_cluster_counts
+    )
     summary.update(
         {
             "backend": "faiss_ivf_quantizer",
@@ -571,6 +610,7 @@ def main() -> None:
             "cluster_id",
             "rank",
             "predicate",
+            "base_vectors_in_cluster",
             "cluster_query_hits",
             "cluster_total_hits",
             "cluster_hit_fraction",
@@ -580,6 +620,15 @@ def main() -> None:
             "in_global_top_k",
         ],
     )
+    if base_cluster_counts is not None:
+        write_csv(
+            output_dir / "cluster_base_counts.csv",
+            [
+                {"cluster_id": cluster_id, "base_vectors_in_cluster": count}
+                for cluster_id, count in sorted(base_cluster_counts.items())
+            ],
+            ["cluster_id", "base_vectors_in_cluster"],
+        )
     write_csv(output_dir / "cluster_hot_filter_summary.csv", [summary], list(summary.keys()))
 
     print(f"backend=faiss_ivf_quantizer")
@@ -593,6 +642,10 @@ def main() -> None:
     print(f"coverage_lift_local_over_global={summary['coverage_lift_local_over_global']}")
     print(f"avg_cluster_top_k_overlap_with_global={summary['avg_cluster_top_k_overlap_with_global']}")
     print(f"local_top_entries_not_in_global_top_k={summary['local_top_entries_not_in_global_top_k']}")
+    if base_cluster_counts is not None:
+        print(f"base_vectors_assigned={summary['base_vectors_assigned']}")
+        print(f"base_populated_clusters={summary['base_populated_clusters']}")
+        print(f"base_cluster_avg_size={summary['base_cluster_avg_size']}")
     print(f"output_dir={output_dir}")
 
 
