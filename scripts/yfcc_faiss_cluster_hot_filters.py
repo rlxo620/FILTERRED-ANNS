@@ -21,6 +21,12 @@ Supported vector formats:
   * .npy  : numpy array [N, D], float32-compatible
   * .fbin : int32 N, int32 D header followed by float32 data
   * .fvecs: repeated int32 D followed by D float32 values
+  * .u8bin: int32 N, int32 D header followed by uint8 data
+
+Supported query-filter formats:
+  * .csv  : predicate column or filter columns
+  * .spmat: CSR sparse metadata matrix from big-ann-benchmarks
+            (each query row's nonzero metadata ids become one predicate)
 """
 
 from __future__ import annotations
@@ -117,6 +123,32 @@ class FbinMatrix(MatrixSource):
             yield start, np.asarray(self.array[start:end], dtype=np.float32)
 
 
+class U8binMatrix(MatrixSource):
+    def __init__(self, path: Path):
+        np = require_numpy()
+        self.path = path
+        with path.open("rb") as handle:
+            header = handle.read(8)
+        if len(header) != 8:
+            raise SystemExit(f"{path} is too small for .u8bin header")
+        nrows, dim = struct.unpack("<ii", header)
+        if nrows <= 0 or dim <= 0:
+            raise SystemExit(f"{path} has invalid .u8bin shape: {nrows} x {dim}")
+        self.shape = (int(nrows), int(dim))
+        self.array = np.memmap(path, dtype=np.uint8, mode="r", offset=8, shape=self.shape)
+
+    def read_rows(self, indices: Sequence[int]):
+        np = require_numpy()
+        return np.asarray(self.array[list(indices)], dtype=np.float32)
+
+    def iter_chunks(self, chunk_rows: int):
+        np = require_numpy()
+        nrows = self.shape[0]
+        for start in range(0, nrows, chunk_rows):
+            end = min(start + chunk_rows, nrows)
+            yield start, np.asarray(self.array[start:end], dtype=np.float32)
+
+
 class FvecsMatrix(MatrixSource):
     def __init__(self, path: Path):
         np = require_numpy()
@@ -168,9 +200,11 @@ def open_matrix(path: Path) -> MatrixSource:
         return NpyMatrix(path)
     if suffix == ".fbin":
         return FbinMatrix(path)
+    if suffix == ".u8bin":
+        return U8binMatrix(path)
     if suffix == ".fvecs":
         return FvecsMatrix(path)
-    raise SystemExit(f"Unsupported vector format: {path}. Use .npy, .fbin, or .fvecs")
+    raise SystemExit(f"Unsupported vector format: {path}. Use .npy, .fbin, .u8bin, or .fvecs")
 
 
 def parse_csv_list(value: str) -> List[str]:
@@ -243,19 +277,71 @@ def train_or_load_quantizer(args, base: MatrixSource):
     return quantizer, int(centroids.shape[0])
 
 
+def spmat_query_predicates(filters_spmat: Path, prefix: str, vocabulary: Optional[Path]) -> List[str]:
+    np = require_numpy()
+    with filters_spmat.open("rb") as handle:
+        header = handle.read(24)
+    if len(header) != 24:
+        raise SystemExit(f"{filters_spmat} is too small for .spmat header")
+    nrow, ncol, nnz = struct.unpack("<qqq", header)
+    if nrow <= 0 or ncol <= 0 or nnz < 0:
+        raise SystemExit(f"{filters_spmat} has invalid .spmat shape")
+
+    indptr_offset = 24
+    indices_offset = indptr_offset + 8 * (nrow + 1)
+    data_offset = indices_offset + 4 * nnz
+    expected_min_size = data_offset + 4 * nnz
+    actual_size = filters_spmat.stat().st_size
+    if actual_size < expected_min_size:
+        raise SystemExit(
+            f"{filters_spmat} is too small for expected CSR payload: "
+            f"actual={actual_size} expected>={expected_min_size}"
+        )
+
+    indptr = np.memmap(filters_spmat, dtype=np.int64, mode="r", offset=indptr_offset, shape=(nrow + 1,))
+    indices = np.memmap(filters_spmat, dtype=np.int32, mode="r", offset=indices_offset, shape=(nnz,))
+
+    vocab: Optional[List[str]] = None
+    if vocabulary is not None:
+        with vocabulary.open(encoding="utf-8") as handle:
+            vocab = [line.rstrip("\n") for line in handle]
+
+    predicates: List[str] = []
+    for row_id in range(nrow):
+        start = int(indptr[row_id])
+        end = int(indptr[row_id + 1])
+        terms = [int(x) for x in indices[start:end]]
+        if not terms:
+            predicates.append("<empty>")
+            continue
+        labels = []
+        for term in sorted(terms):
+            if vocab is not None and 0 <= term < len(vocab):
+                labels.append(f"{prefix}=={vocab[term]}")
+            else:
+                labels.append(f"{prefix}=={term}")
+        predicates.append(" AND ".join(labels))
+    return predicates
+
+
 def query_predicates(
-    filters_csv: Path,
+    filters_path: Path,
     predicate_column: str,
     filter_columns: Sequence[str],
+    spmat_prefix: str,
+    spmat_vocabulary: Optional[Path],
 ) -> List[str]:
-    header = csv_header(filters_csv)
+    if filters_path.suffix.lower() == ".spmat":
+        return spmat_query_predicates(filters_path, spmat_prefix, spmat_vocabulary)
+
+    header = csv_header(filters_path)
     if predicate_column not in header and not filter_columns:
         raise SystemExit(
-            f"{filters_csv} needs column {predicate_column!r} or --query-filter-columns"
+            f"{filters_path} needs column {predicate_column!r} or --query-filter-columns"
         )
 
     predicates: List[str] = []
-    for row in iter_csv(filters_csv):
+    for row in iter_csv(filters_path):
         if predicate_column in row and row[predicate_column].strip():
             predicates.append(row[predicate_column].strip())
             continue
@@ -422,9 +508,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-vectors", required=True, help=".npy, .fbin, or .fvecs base embeddings")
     parser.add_argument("--query-vectors", required=True, help=".npy, .fbin, or .fvecs query embeddings")
-    parser.add_argument("--query-filters-csv", required=True)
+    parser.add_argument("--query-filters-csv", required=True, help="CSV or big-ann .spmat query metadata")
     parser.add_argument("--query-predicate-column", default="predicate")
     parser.add_argument("--query-filter-columns", default="", help="Comma-separated columns if no predicate column")
+    parser.add_argument("--spmat-prefix", default="tag", help="Predicate prefix for .spmat metadata ids")
+    parser.add_argument("--spmat-vocabulary", default=None, help="Optional words.txt for .spmat metadata ids")
     parser.add_argument("--faiss-index", default=None, help="Optional existing FAISS IVF index")
     parser.add_argument("--centroids-npy", default=None, help="Optional path to load/save IVF centroids")
     parser.add_argument("--nlist", type=int, default=1024)
@@ -446,6 +534,8 @@ def main() -> None:
         Path(args.query_filters_csv),
         args.query_predicate_column,
         parse_csv_list(args.query_filter_columns),
+        args.spmat_prefix,
+        Path(args.spmat_vocabulary) if args.spmat_vocabulary else None,
     )
 
     quantizer, nlist = train_or_load_quantizer(args, base)
